@@ -81,7 +81,9 @@ func TestAlertStormCorrelatesAndAcknowledgementCancelsEscalation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	verifyTransactionalInbox(t, ctx, store, tenantID)
 	verifyOutOfOrderCorrelation(t, ctx, store, tenantID)
+	verifyEscalationFencing(t, ctx, store, tenantID)
 	// Keep the test fast while preserving a two-step escalation policy.
 	if _, err := store.Pool().Exec(ctx, `
 		UPDATE escalation_policy_steps SET delay_seconds=2 WHERE step_number=1`); err != nil {
@@ -214,6 +216,54 @@ func TestAlertStormCorrelatesAndAcknowledgementCancelsEscalation(t *testing.T) {
 	verifyReadOnlyMCP(t, ctx, store, logger, incident.ID)
 }
 
+func verifyTransactionalInbox(t *testing.T, ctx context.Context, store *database.Store, tenantID uuid.UUID) {
+	t.Helper()
+	receivedAt := time.Now().UTC().Add(72 * time.Hour).Truncate(time.Microsecond)
+	alertID := uuid.New()
+	requestHash := sha256.Sum256([]byte("transactional-inbox"))
+	if _, err := store.Pool().Exec(ctx, `
+		INSERT INTO alerts (
+			id, tenant_id, idempotency_key, fingerprint, service, title, severity,
+			labels, details, occurred_at, received_at, request_hash
+		) VALUES ($1,$2,'transactional-inbox','transactional-inbox','inbox-test',
+		          'Transactional inbox test','warning','{}','{}',$3,$3,$4)`,
+		alertID, tenantID, receivedAt, requestHash[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	envelope, err := domain.NewAlertReceivedEnvelope(tenantID, alertID, receivedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident, duplicate, err := store.CorrelateAlert(
+		ctx, "transactional-inbox-test", envelope.ID, envelope.TenantID, alertID, 15*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate || incident.OccurrenceCount != 1 {
+		t.Fatalf("first inbox application: duplicate=%v incident=%#v", duplicate, incident)
+	}
+
+	_, duplicate, err = store.CorrelateAlert(
+		ctx, "transactional-inbox-test", envelope.ID, envelope.TenantID, alertID, 15*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !duplicate {
+		t.Fatal("reapplying the same event envelope was not reported as an inbox duplicate")
+	}
+
+	stored, err := store.GetIncident(ctx, tenantID, incident.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.OccurrenceCount != incident.OccurrenceCount {
+		t.Fatalf("duplicate inbox application changed occurrence count from %d to %d", incident.OccurrenceCount, stored.OccurrenceCount)
+	}
+}
+
 func verifyOutOfOrderCorrelation(t *testing.T, ctx context.Context, store *database.Store, tenantID uuid.UUID) {
 	t.Helper()
 	base := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Microsecond)
@@ -304,6 +354,90 @@ func verifyOutOfOrderCorrelation(t *testing.T, ctx context.Context, store *datab
 	if deadEvents != 1 {
 		t.Fatalf("expired final attempt timeline events = %d", deadEvents)
 	}
+}
+
+func verifyEscalationFencing(t *testing.T, ctx context.Context, store *database.Store, tenantID uuid.UUID) {
+	t.Helper()
+	receivedAt := time.Now().UTC().Add(96 * time.Hour).Truncate(time.Microsecond)
+	alertID := uuid.New()
+	requestHash := sha256.Sum256([]byte("escalation-fencing"))
+	if _, err := store.Pool().Exec(ctx, `
+		INSERT INTO alerts (
+			id, tenant_id, idempotency_key, fingerprint, service, title, severity,
+			labels, details, occurred_at, received_at, request_hash
+		) VALUES ($1,$2,'escalation-fencing','escalation-fencing','scheduler-test',
+		          'Escalation fencing test','critical','{}','{}',$3,$3,$4)`,
+		alertID, tenantID, receivedAt, requestHash[:]); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := domain.NewAlertReceivedEnvelope(tenantID, alertID, receivedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident, duplicate, err := store.CorrelateAlert(
+		ctx, "escalation-fencing-test", envelope.ID, envelope.TenantID, alertID, 15*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate {
+		t.Fatal("fencing setup event was unexpectedly treated as a duplicate")
+	}
+
+	var escalationID uuid.UUID
+	if err := store.Pool().QueryRow(ctx, `
+		UPDATE incident_escalations
+		SET due_at=now(), status='pending', attempts=0, lease_id=NULL, lease_until=NULL
+		WHERE incident_id=$1 AND step_number=0
+		RETURNING id`, incident.ID).Scan(&escalationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pool().Exec(ctx, `
+		UPDATE incident_escalations SET status='cancelled'
+		WHERE incident_id=$1 AND step_number<>0`, incident.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	firstClaims, err := store.ClaimEscalations(ctx, 10, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := escalationByID(firstClaims, escalationID)
+	if !ok {
+		t.Fatalf("first claim did not include escalation %s: %#v", escalationID, firstClaims)
+	}
+	if _, err := store.Pool().Exec(ctx, `
+		UPDATE incident_escalations SET lease_until=now()-interval '1 second'
+		WHERE id=$1 AND status='running'`, escalationID); err != nil {
+		t.Fatal(err)
+	}
+
+	secondClaims, err := store.ClaimEscalations(ctx, 10, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, ok := escalationByID(secondClaims, escalationID)
+	if !ok {
+		t.Fatalf("expired lease was not reclaimed for escalation %s: %#v", escalationID, secondClaims)
+	}
+	if second.FencingToken <= first.FencingToken {
+		t.Fatalf("reclaim did not advance fencing token: first=%d second=%d", first.FencingToken, second.FencingToken)
+	}
+	if err := store.CompleteEscalation(ctx, first, time.Now().UTC()); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("stale fencing token completion error = %v, want %v", err, domain.ErrConflict)
+	}
+	if err := store.CompleteEscalation(ctx, second, time.Now().UTC()); err != nil {
+		t.Fatalf("complete escalation with current fencing token: %v", err)
+	}
+}
+
+func escalationByID(escalations []domain.Escalation, escalationID uuid.UUID) (domain.Escalation, bool) {
+	for _, escalation := range escalations {
+		if escalation.ID == escalationID {
+			return escalation, true
+		}
+	}
+	return domain.Escalation{}, false
 }
 
 func verifyReadOnlyMCP(t *testing.T, ctx context.Context, store *database.Store, logger *slog.Logger, incidentID uuid.UUID) {

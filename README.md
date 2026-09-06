@@ -102,7 +102,7 @@ make verify
 make integration
 ```
 
-The integration test starts real PostgreSQL and NATS containers. It checks 100 concurrent alert writes, single-incident correlation, idempotent replay, tenant isolation, escalation delivery and ACK cancellation.
+The integration test starts real PostgreSQL and NATS containers. It checks 100 concurrent alert writes, single-incident correlation, request and consumer-inbox replay, tenant isolation, escalation delivery, lease takeover with stale-token fencing and ACK cancellation.
 
 Run a reproducible ingestion profile after starting the stack:
 
