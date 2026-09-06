@@ -1,0 +1,140 @@
+name: incident-flow
+
+x-app-environment: &app-environment
+  DATABASE_URL: postgres://incidentflow:incidentflow@postgres:5432/incidentflow?sslmode=disable
+  NATS_URL: nats://nats:4222
+  DEMO_TENANT_SLUG: demo
+  DEMO_TENANT_NAME: Demo Team
+  DEMO_API_KEY: ${DEMO_API_KEY:-demo-api-key-change-me}
+  DEMO_WEBHOOK_SECRET: ${DEMO_WEBHOOK_SECRET:-demo-webhook-secret-change-me}
+  NOTIFICATION_TARGET: http://api:8080/internal/demo/notifications
+  CORRELATION_WINDOW: 15m
+  LOG_LEVEL: info
+  ENABLE_DEMO_SINK: "true"
+
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: incidentflow
+      POSTGRES_USER: incidentflow
+      POSTGRES_PASSWORD: incidentflow
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U incidentflow -d incidentflow"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: migrate
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: seed
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: api
+    environment: *app-environment
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: worker
+    environment: *app-environment
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mcp:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: mcp
+    environment:
+      <<: *app-environment
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+    ports:
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8090/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./deployments/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  nats-data:

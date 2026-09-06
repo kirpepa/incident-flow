@@ -1,0 +1,264 @@
+openapi: 3.1.0
+info:
+  title: IncidentFlow API
+  version: 0.1.0
+  description: Event-driven alert correlation and incident escalation API.
+servers:
+  - url: http://localhost:8080
+security:
+  - ApiKey: []
+paths:
+  /healthz:
+    get:
+      summary: Check process liveness.
+      security: []
+      operationId: health
+      responses:
+        "200":
+          description: Process is alive.
+  /readyz:
+    get:
+      summary: Check database readiness.
+      security: []
+      operationId: readiness
+      responses:
+        "200":
+          description: PostgreSQL is available. Broker outages do not stop durable ingestion into the outbox.
+        "503":
+          $ref: "#/components/responses/Error"
+  /v1/alerts:
+    post:
+      operationId: ingestAlert
+      summary: Accept a signed alert for asynchronous correlation.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: X-IncidentFlow-Timestamp
+          in: header
+          required: true
+          schema: { type: string }
+          description: Unix timestamp included in the HMAC input.
+        - name: X-IncidentFlow-Signature
+          in: header
+          required: true
+          schema: { type: string, pattern: '^sha256=[a-f0-9]{64}$' }
+          description: HMAC-SHA256 of `POST\n/v1/alerts\n<timestamp>\n<idempotency-key>\n<raw-body>`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlertInput"
+      responses:
+        "202":
+          description: A new alert and outbox event were committed atomically.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AlertReceipt" }
+        "200":
+          description: Idempotent replay of an already accepted alert.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AlertReceipt" }
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: The idempotency key was already used with a different alert payload.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /v1/incidents:
+    get:
+      summary: List tenant incidents.
+      operationId: listIncidents
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/IncidentStatus" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: before
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Incidents ordered by most recent alert.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Incident" }
+  /v1/incidents/{incidentID}:
+    parameters:
+      - $ref: "#/components/parameters/IncidentID"
+    get:
+      summary: Get one tenant incident.
+      operationId: getIncident
+      responses:
+        "200":
+          description: Current incident state. The ETag contains its version.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Incident" }
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/incidents/{incidentID}/timeline:
+    parameters:
+      - $ref: "#/components/parameters/IncidentID"
+    get:
+      summary: Get the most recent incident timeline events.
+      operationId: getIncidentTimeline
+      responses:
+        "200":
+          description: Chronological audit timeline.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/TimelineEvent" }
+  /v1/incidents/{incidentID}/ack:
+    parameters:
+      - $ref: "#/components/parameters/IncidentID"
+    post:
+      summary: Acknowledge an open incident.
+      operationId: acknowledgeIncident
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransitionInput" }
+      responses:
+        "200":
+          description: Incident acknowledged and pending escalations cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Incident" }
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/incidents/{incidentID}/resolve:
+    parameters:
+      - $ref: "#/components/parameters/IncidentID"
+    post:
+      summary: Resolve an active incident.
+      operationId: resolveIncident
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransitionInput" }
+      responses:
+        "200":
+          description: Incident resolved and pending escalations cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Incident" }
+        "409":
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    IncidentID:
+      name: incidentID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 200 }
+  responses:
+    Error:
+      description: Error response.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Severity:
+      type: string
+      enum: [info, warning, critical]
+    IncidentStatus:
+      type: string
+      enum: [open, acknowledged, resolved]
+    AlertInput:
+      type: object
+      required: [service, title, severity]
+      additionalProperties: false
+      properties:
+        external_id: { type: string, maxLength: 256 }
+        fingerprint: { type: string, maxLength: 256, description: Optional correlation key. A stable key is derived when omitted. }
+        service: { type: string, minLength: 1, maxLength: 128 }
+        title: { type: string, minLength: 1, maxLength: 512 }
+        severity: { $ref: "#/components/schemas/Severity" }
+        labels:
+          type: object
+          maxProperties: 50
+          additionalProperties: { type: string, maxLength: 512 }
+        details:
+          type: object
+          additionalProperties: true
+        occurred_at: { type: string, format: date-time }
+    AlertReceipt:
+      type: object
+      required: [alert_id, duplicate]
+      properties:
+        alert_id: { type: string, format: uuid }
+        duplicate: { type: boolean }
+    Incident:
+      type: object
+      required: [id, fingerprint, service, title, severity, status, occurrence_count, first_seen_at, last_seen_at, version]
+      properties:
+        id: { type: string, format: uuid }
+        fingerprint: { type: string }
+        service: { type: string }
+        title: { type: string }
+        severity: { $ref: "#/components/schemas/Severity" }
+        status: { $ref: "#/components/schemas/IncidentStatus" }
+        occurrence_count: { type: integer, minimum: 1 }
+        first_seen_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        acknowledged_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time }
+        version: { type: integer, minimum: 1 }
+    TimelineEvent:
+      type: object
+      required: [id, incident_id, kind, created_at]
+      properties:
+        id: { type: integer }
+        incident_id: { type: string, format: uuid }
+        kind: { type: string }
+        actor: { type: string }
+        data: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+    TransitionInput:
+      type: object
+      additionalProperties: false
+      properties:
+        actor: { type: string, minLength: 1, maxLength: 128, default: api-client }
+        note: { type: string, maxLength: 2000 }
+        expected_version: { type: integer, minimum: 1 }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+        request_id: { type: string }

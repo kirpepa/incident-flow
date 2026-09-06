@@ -1,0 +1,10 @@
+.git
+.github
+.env
+.idea
+.vscode
+bin
+coverage.out
+coverage.html
+tmp
+**/*_test.go
